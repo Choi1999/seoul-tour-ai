@@ -1,0 +1,12 @@
+pandas
+openpyxl
+python-dotenv
+streamlit
+langgraph
+langchain-core
+langchain-openai
+langchain-chroma
+langchain-huggingface
+chromadb
+sentence-transformers
+torch
