@@ -216,3 +216,28 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project secrets
+.env
+.env.*
+!.env.example
+
+# Local restaurant data
+*.csv
+*.xlsx
+*.xls
+*.parquet
+
+# Keep the data directory structure only
+data/*
+!data/.gitkeep
+!data/README.md
+
+# Generated Chroma vector database
+chroma_db/
+**/chroma_db/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
