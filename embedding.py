@@ -1,86 +1,110 @@
-from pathlib import Path
-from tqdm import tqdm
-
-# from langchain_community.document_loaders import DirectoryLoader, UnstructuredFileLoader # pip install "unstructured[pdf]"
-from langchain_community.document_loaders import CSVLoader, PyPDFLoader, DirectoryLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
+from __future__ import annotations
 
 import os
-os.environ["HF_TOKEN"] = "" # https://share.gemini.google/Gh34Hyl6F6W9
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+import chromadb
+from dotenv import load_dotenv
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+
 
 BASE_DIR = Path(__file__).resolve().parent
-print(BASE_DIR)
+load_dotenv(BASE_DIR / ".env")
 
-''' # DirectoryLoader https://share.google/aimode/lcByqRQMwspDzgtzY
-loader = DirectoryLoader(
-    path="./data",
-    glob="**/*.*",
-    loader_cls=UnstructuredFileLoader, # pip install unstructured
-    loader_kwargs={'languages': ["kor", "eng"]}, # https://share.gemini.google/kA7BelztavMi
-    use_multithreading=True,  # Spawns parallel worker threads
-    max_concurrency=4         # Adjust based on your CPU cores
+
+def _resolve_project_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path.resolve()
+
+
+CHROMA_PATH = _resolve_project_path(
+    os.getenv("CHROMA_PERSIST_DIR", "chroma_db")
 )
+CHROMA_COLLECTION_NAME = os.getenv(
+    "CHROMA_COLLECTION_NAME", "langchain"
+).strip()
+EMBEDDING_MODEL = os.getenv(
+    "EMBEDDING_MODEL", "BAAI/bge-m3"
+).strip()
+EMBEDDING_DEVICE = os.getenv(
+    "EMBEDDING_DEVICE", "cpu"
+).strip()
 
-documents = loader.load()
-'''
 
-# https://share.google/aimode/X5EG0DwPY4TJrO61x
-loader_mapping = { # https://share.gemini.google/2phhGllF1cFP
-    ".pdf": (PyPDFLoader, {}),
-    ".csv": (CSVLoader, {'encoding': "utf-8"})
-}
+@lru_cache(maxsize=1)
+def get_embeddings() -> HuggingFaceEmbeddings:
+    """기존 DB 조회에 사용할 임베딩 모델만 로드한다."""
+    model_kwargs: dict[str, Any] = {}
+    if EMBEDDING_DEVICE:
+        model_kwargs["device"] = EMBEDDING_DEVICE
 
-# 문서 로드
-documents = []
-
-for ext, (loader_cls, loader_kwargs) in loader_mapping.items():
-    loader = DirectoryLoader(
-        path="./data",
-        glob=f"**/*{ext}",
-        loader_cls=loader_cls,
-        loader_kwargs=loader_kwargs,
-        show_progress=True,
-        use_multithreading=True # Optional: Speeds up heavy tasks
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        model_kwargs=model_kwargs,
     )
-    documents.extend(loader.load())
 
-print(f"Successfully loaded {len(documents)} documents.")
 
-# 문서 분할
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size = 1000,
-    chunk_overlap = 150
-)
+@lru_cache(maxsize=1)
+def get_chroma_client() -> Any:
+    """기존 ChromaDB를 열고 컬렉션 존재 여부를 확인한다."""
+    sqlite_path = CHROMA_PATH / "chroma.sqlite3"
 
-docs_splited = splitter.split_documents(documents)
-print("# of chunks:", len(docs_splited))
+    if not CHROMA_PATH.is_dir():
+        raise FileNotFoundError(f"ChromaDB 폴더가 없습니다: {CHROMA_PATH}")
+    if not sqlite_path.is_file():
+        raise FileNotFoundError(f"ChromaDB 파일이 없습니다: {sqlite_path}")
 
-# 임베딩
-embedding = HuggingFaceEmbeddings(
-    model_name="BAAI/bge-m3",
-)
+    client = chromadb.PersistentClient(path=str(CHROMA_PATH))
 
-DB_PATH = BASE_DIR / "chroma_db"
+    try:
+        client.get_collection(name=CHROMA_COLLECTION_NAME)
+    except Exception as error:
+        try:
+            collection_names = [
+                getattr(collection, "name", str(collection))
+                for collection in client.list_collections()
+            ]
+        except Exception:
+            collection_names = []
 
-'''
-db = Chroma.from_documents(
-    documents = docs_splited,
-    embedding = embedding,
-    persist_directory = str(DB_PATH)
-)
-'''
+        raise RuntimeError(
+            "기존 ChromaDB 컬렉션 연결에 실패했습니다. "
+            f"요청 컬렉션={CHROMA_COLLECTION_NAME}, "
+            f"확인 컬렉션={collection_names}"
+        ) from error
 
-db = Chroma(
-    embedding_function=embedding,
-    persist_directory=str(DB_PATH)
-)
+    return client
 
-# https://share.gemini.google/ZBestRkquiKk
-BATCH_SIZE = 5000 # Chroma가 안정적으로 처리할 수 있는 단위
 
-for i in tqdm(range(0, len(docs_splited), BATCH_SIZE), desc="Embedding & Inserting to Chroma"):
-    batch_docs = docs_splited[i : i + BATCH_SIZE]
-    db.add_documents(batch_docs)
+@lru_cache(maxsize=1)
+def get_vectorstore() -> Chroma:
+    """문서 추가나 재임베딩 없이 기존 컬렉션을 조회용으로 반환한다."""
+    return Chroma(
+        client=get_chroma_client(),
+        collection_name=CHROMA_COLLECTION_NAME,
+        embedding_function=get_embeddings(),
+    )
+
+
+def get_vectorstore_info() -> dict[str, Any]:
+    collection = get_chroma_client().get_collection(
+        name=CHROMA_COLLECTION_NAME
+    )
+    return {
+        "chroma_path": str(CHROMA_PATH),
+        "collection_name": CHROMA_COLLECTION_NAME,
+        "document_count": collection.count(),
+        "embedding_model": EMBEDDING_MODEL,
+        "embedding_device": EMBEDDING_DEVICE,
+    }
+
+
+def clear_embedding_cache() -> None:
+    get_vectorstore.cache_clear()
+    get_chroma_client.cache_clear()
+    get_embeddings.cache_clear()
